@@ -152,6 +152,71 @@ def prefetch_tensor(A: torch.Tensor, to_cpu=False):
     lib.cprefetch(get_ptr(A), ct.c_size_t(A.nbytes), ct.c_int32(deviceid))
 
 
+def is_unified_memory(device: int = 0) -> bool:
+    """Check if the given CUDA device uses unified memory (CPU+GPU shared pool).
+
+    Returns True on platforms where CPU and GPU share the same physical memory
+    via hardware coherence (e.g. NVIDIA GB10 / DGX Spark with NVLink-C2C).
+    On these platforms, ``cudaMallocManaged`` and ``cudaMalloc`` both allocate
+    from the same LPDDR5x pool, so there is no performance penalty for using
+    managed memory.
+
+    Returns:
+        True if the device supports direct managed memory access from the host.
+    """
+    result = ct.c_int(0)
+    # cudaDevAttrDirectManagedMemAccessFromHost = 101
+    try:
+        torch.cuda.cudart().cudaDeviceGetAttribute(
+            ct.byref(result), 101, device
+        )
+    except Exception:
+        return False
+    return result.value != 0
+
+
+def mark_weights_readonly(model):
+    """Mark frozen model weights as read-mostly for unified memory optimization.
+
+    Calls ``cudaMemAdviseSetReadMostly`` on each frozen parameter to allow
+    the hardware to create read replicas, reducing bandwidth contention
+    between weight reads (forward pass) and gradient writes (backward pass).
+
+    **Important:** ``cudaMemAdvise`` only works on managed memory
+    (``cudaMallocManaged``).  Standard PyTorch tensors use ``cudaMalloc``.
+    To make this function work, the caller must ensure tensors are backed
+    by managed memory.  The recommended approach is to set the environment
+    variable ``CUDA_MANAGED_FORCE_DEVICE_ALLOC=1`` **before CUDA
+    initialization** (before any ``import torch`` or ``torch.cuda`` call).
+    On unified memory platforms this has no performance penalty since both
+    allocators use the same physical memory pool.
+
+    On discrete GPU systems, ``cudaMemAdvise`` on non-managed memory returns
+    an error.  Always check :func:`is_unified_memory` before calling.
+
+    Args:
+        model: A PyTorch model. Only frozen parameters (requires_grad=False)
+               on CUDA devices are affected.
+
+    Returns:
+        (count, errors): Number of parameters marked and number of errors.
+    """
+    count = 0
+    errors = 0
+    for param in model.parameters():
+        if not param.requires_grad and param.is_cuda:
+            try:
+                lib.cset_readonly(
+                    get_ptr(param),
+                    ct.c_size_t(param.nbytes),
+                    ct.c_int32(param.device.index or 0),
+                )
+                count += 1
+            except RuntimeError:
+                errors += 1
+    return count, errors
+
+
 def elementwise_func(func_name, A, B, value, prefetch=True):
     func = None
     if A.dtype == torch.float32:

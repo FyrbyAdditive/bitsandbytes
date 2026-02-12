@@ -667,9 +667,32 @@ void cspmm_coo_very_sparse_naive_int8(
 
 void* cget_managed_ptr(size_t bytes) {
     void* ptr;
-    CUDA_CHECK_RETURN(cudaMallocManaged(&ptr, bytes, cudaMemAttachHost));
-    CUDA_CHECK_RETURN(cudaPeekAtLastError());
 
+    // On unified memory platforms (e.g. NVIDIA GB10 / DGX Spark), CPU and GPU
+    // share the same physical memory pool via hardware coherence (NVLink-C2C).
+    // cudaMemAttachHost forces initial CPU-side attachment, which causes an
+    // unnecessary page fault on the first GPU access.  Detecting unified memory
+    // at runtime lets us skip that and use SetAccessedBy instead.
+    int directAccess = 0;
+    cudaDeviceGetAttribute(&directAccess, cudaDevAttrDirectManagedMemAccessFromHost, 0);
+
+    if (directAccess) {
+        // Unified memory: default attachment is fine, advise GPU access
+        CUDA_CHECK_RETURN(cudaMallocManaged(&ptr, bytes));
+#if CUDART_VERSION >= 13000
+        cudaMemLocation loc{};
+        loc.type = cudaMemLocationTypeDevice;
+        loc.id = 0;
+        cudaMemAdvise(ptr, bytes, cudaMemAdviseSetAccessedBy, loc);
+#else
+        cudaMemAdvise(ptr, bytes, cudaMemAdviseSetAccessedBy, 0);
+#endif
+    } else {
+        // Discrete GPU: attach to host first (existing behavior)
+        CUDA_CHECK_RETURN(cudaMallocManaged(&ptr, bytes, cudaMemAttachHost));
+    }
+
+    CUDA_CHECK_RETURN(cudaPeekAtLastError());
     return ptr;
 }
 
@@ -680,6 +703,13 @@ void cprefetch(void* ptr, size_t bytes, int device) {
         cudaDeviceGetAttribute(&hasPrefetch, cudaDevAttrConcurrentManagedAccess, device)
     ); // 40ns overhead
     if (hasPrefetch == 0)
+        return;
+
+    // On unified memory platforms, prefetch is a no-op (hardware coherence
+    // handles data placement automatically).  Skip to avoid overhead.
+    int directAccess = 0;
+    cudaDeviceGetAttribute(&directAccess, cudaDevAttrDirectManagedMemAccessFromHost, device);
+    if (directAccess)
         return;
 
 #if CUDART_VERSION >= 13000
@@ -693,6 +723,22 @@ void cprefetch(void* ptr, size_t bytes, int device) {
 
     CUDA_CHECK_RETURN(cudaPeekAtLastError());
 }
+
+void cset_readonly(void* ptr, size_t bytes, int device) {
+    // Mark managed memory as read-mostly — a hint that allows the hardware to
+    // optimize read paths (e.g. create read replicas on unified memory).
+    // NOTE: ptr MUST point to cudaMallocManaged memory, not cudaMalloc memory.
+    // Calling this on regular device memory returns cudaErrorInvalidValue.
+#if CUDART_VERSION >= 13000
+    cudaMemLocation loc{};
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = device;
+    cudaMemAdvise(ptr, bytes, cudaMemAdviseSetReadMostly, loc);
+#else
+    cudaMemAdvise(ptr, bytes, cudaMemAdviseSetReadMostly, device);
+#endif
+}
+
 
 #define CMAKE_ELEMENTWISE_FUNC(fname, type_name, ctype, FUNC)                                                          \
     void c##fname##_##type_name(ctype* A, ctype* B, ctype value, long n) { fname##_##type_name(A, B, value, n); }
